@@ -169,18 +169,20 @@ const delay = ms => new Promise(res => setTimeout(res, ms));
 
 async function runRegionalSweep() {
     console.log("[STEALTH] Launching Scraper for Deep Intel...");
-    const browser = await puppeteer.launch({ 
-        headless: true, 
-        args: [
-            '--no-sandbox', 
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage', // Cloud survival flag
-            '--disable-gpu'            // Cloud survival flag
-        ] 
-    });
-    const page = await browser.newPage();
+    let browser;
 
     try {
+        browser = await puppeteer.launch({
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage', // Cloud survival flag
+                '--disable-gpu'            // Cloud survival flag
+            ]
+        });
+        const page = await browser.newPage();
+
         await page.goto('https://www.marinetraffic.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
         const targetZones = [
             {
@@ -253,7 +255,7 @@ async function runRegionalSweep() {
     } catch (error) {
         console.error("[STEALTH ERROR]:", error.message);
     } finally {
-        await browser.close();
+        if (browser) await browser.close();
     }
 }
 setInterval(runRegionalSweep, 300000); // Every 5 minutes
