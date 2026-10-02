@@ -630,11 +630,16 @@ async function takeShipFrames() {
     }
 }
 
-async function fetchAdsb(path) {
+async function fetchAdsb(path, attempt = 1) {
     const res = await fetch('https://api.adsb.lol/v2' + path, {
         signal: AbortSignal.timeout(15000),
         headers: { 'user-agent': 'worldview-radar/2.0' }
     });
+    // Rate limited (429): wait and try once more
+    if (res.status === 429 && attempt < 2) {
+        await sleep(8000);
+        return fetchAdsb(path, attempt + 1);
+    }
     if (!res.ok) throw new Error('ADSB HTTP ' + res.status);
     return res.json();
 }
@@ -673,7 +678,7 @@ async function takePlaneFrame() {
         }
 
         for (const a of PLANE_AREAS) {
-            await sleep(1000);
+            await sleep(4000); // adsb.lol rate-limits fast bursts
             try {
                 const d = await fetchAdsb(`/point/${a.lat}/${a.lon}/${a.radius}`);
                 for (const ac of (d.ac || d.aircraft || [])) addPlane(planes, ac, false);
