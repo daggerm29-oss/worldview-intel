@@ -201,6 +201,7 @@ function catFromCategory(c) {
 // =====================================================================
 let aisSocket = null;
 let lastAisMessageAt = Date.now();
+let aisFailures = 0; // consecutive failed connections (for the growing wait)
 
 async function logReappearance(mmsi, name, dark, lat, lon) {
     const now = Date.now();
@@ -251,6 +252,7 @@ function connectAIS() {
 
     ws.on('message', (data) => {
         lastAisMessageAt = Date.now();
+        aisFailures = 0;
         try {
             const msg = JSON.parse(data);
             if (msg.MessageType !== 'PositionReport') return;
@@ -289,8 +291,11 @@ function connectAIS() {
     });
 
     ws.on('close', () => {
-        console.log('[AIS] Disconnected. Reconnecting in 5s...');
-        setTimeout(connectAIS, 5000);
+        // wait 5s, 10s, 20s, 40s, then 60s between tries (hammering AISStream keeps the 429 going)
+        const wait = Math.min(60000, 5000 * Math.pow(2, Math.min(aisFailures, 4)));
+        aisFailures++;
+        console.log(`[AIS] Disconnected. Reconnecting in ${wait / 1000}s...`);
+        setTimeout(connectAIS, wait);
     });
 }
 
@@ -582,6 +587,10 @@ function computeOilStats() {
 
 async function takeOilSnapshot() {
     try {
+        if (deepIntel.india.size === 0) {
+            console.log('[ANALYTICS] India data not loaded yet - snapshot skipped.');
+            return;
+        }
         const st = computeOilStats();
         const { error } = await supabase.from('oil_transit_history').insert({
             region: 'INDIAN_SUBCONTINENT',
@@ -1077,7 +1086,7 @@ app.listen(PORT, async () => {
     setInterval(detectDarkFleet, 60 * 1000);
     setInterval(cleanLiveVessels, 5 * MIN);
     setInterval(takeOilSnapshot, HOUR);
-    setTimeout(takeOilSnapshot, 30 * 1000);
+    setTimeout(takeOilSnapshot, 3 * MIN); // after the first scrape has finished
 
     // wait a little so the AIS feed can fill up before the first frame
     setTimeout(takeShipFrames, 2 * MIN);
