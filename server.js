@@ -49,8 +49,10 @@ const DAY = 24 * HOUR;
 
 const CFG = {
     // dark fleet
-    DARK_THRESHOLD_MS: 5 * MIN,       // silent for 5 min ...
-    DARK_MIN_SOG: 0.5,                // ... while it was moving faster than 0.5 knots
+    DARK_THRESHOLD_MS: 5 * MIN,       // silent for 5 min = "pending" (RAM only, nothing saved) ...
+    DARK_CONFIRM_MS: 30 * MIN,        // ... still silent after 30 min = confirmed, saved to the DB
+    DARK_MIN_SOG: 3,                  // only ships that were really sailing (>= 3 knots), not anchored/jittering
+    MIN_REAL_MOVE_NM: 2,              // came back < 2 nm away = just a coverage gap, not "dark"
     REAPPEAR_MIN_MINUTES: 5,          // log every reappearance (v1 ignored 5-10 min)
     DARK_MEMORY_MS: 72 * HOUR,        // remember dark ships in RAM for 72 h
     // scraper
@@ -59,7 +61,7 @@ const CFG = {
     // playback
     SHIP_FRAME_EVERY_MS: 15 * MIN,
     SHIP_FRAME_KEEP_H: 48,
-    PLANE_FRAME_EVERY_MS: 3 * MIN,
+    PLANE_FRAME_EVERY_MS: 5 * MIN,
     PLANE_FRAME_KEEP_H: 24,
     FRAME_MAX_AGE_MS: 20 * MIN,       // ignore ship positions older than this when taking a frame
     // retention of the other tables (days)
@@ -178,7 +180,8 @@ function isIndiaDestination(dest) {
 // 2. IN-MEMORY STATE  (RAM only, rebuilt after every restart)
 // =====================================================================
 const liveVessels = new Map();   // mmsi(number) -> live AIS position
-const darkNow = new Map();       // mmsi(number) -> { t, lat, lon, sog, cog, name }
+const darkNow = new Map();       // CONFIRMED dark ships: mmsi(number) -> { t, lat, lon, sog, cog, name }
+const darkPending = new Map();   // silent 5-30 min, not saved yet
 const deepIntel = {              // MarineTraffic rows, kept in RAM so /api/radar never reads the DB
     india: new Map(),            // mmsi(string) -> row
     hormuz: new Map()
@@ -205,6 +208,15 @@ async function logReappearance(mmsi, name, dark, lat, lon) {
     if (minutesOffline < CFG.REAPPEAR_MIN_MINUTES) return;
 
     const distanceNm = round(haversineNm(dark.lat, dark.lon, lat, lon), 1);
+
+    // Came back almost where it vanished = it was only a receiver/coverage gap. Remove the false alert.
+    if (distanceNm < CFG.MIN_REAL_MOVE_NM) {
+        console.log(`[DARK FLEET] ${name}: coverage gap (moved ${distanceNm} nm) - false alert removed`);
+        const { error: delErr } = await supabase.from('dark_fleet').delete()
+            .eq('mmsi', String(mmsi)).eq('time_went_dark', new Date(dark.t).toISOString());
+        if (delErr) console.error('Failed to remove false alert:', delErr.message);
+        return;
+    }
     console.log(`[DARK FLEET] REAPPEARED: ${name} after ${minutesOffline} min, moved ${distanceNm} nm while dark`);
 
     const { error } = await supabase.from('dark_fleet_reappearances').upsert({
@@ -263,6 +275,7 @@ function connectAIS() {
             });
 
             // --- REAPPEARANCE DETECTOR ---
+            darkPending.delete(mmsi); // came back before 30 min: normal gap, forget it
             const dark = darkNow.get(mmsi);
             if (dark) {
                 darkNow.delete(mmsi);
@@ -299,34 +312,38 @@ async function detectDarkFleet() {
     darkBusy = true;
     try {
         const now = Date.now();
-        const flagged = [];
+
+        // Step 1: sailing ships that went silent for 5+ min become "pending" (RAM only)
         for (const v of liveVessels.values()) {
             const age = now - v.last_updated;
-            if (age > CFG.DARK_THRESHOLD_MS && (v.sog || 0) > CFG.DARK_MIN_SOG && isHighRiskZone(v.lat, v.lon)) {
-                flagged.push(v);
+            if (age > CFG.DARK_THRESHOLD_MS && (v.sog || 0) >= CFG.DARK_MIN_SOG && isHighRiskZone(v.lat, v.lon)) {
+                liveVessels.delete(v.mmsi);
+                if (!darkNow.has(v.mmsi) && !darkPending.has(v.mmsi)) {
+                    darkPending.set(v.mmsi, { t: v.last_updated, lat: v.lat, lon: v.lon, sog: v.sog, cog: v.cog, name: v.vessel_name });
+                }
             }
         }
 
-        for (const v of flagged) {
-            liveVessels.delete(v.mmsi);
-            if (darkNow.has(v.mmsi)) continue;
+        // Step 2: still silent after 30 min -> confirmed dark, save to Supabase
+        for (const [mmsi, p] of darkPending) {
+            if (now - p.t < CFG.DARK_CONFIRM_MS) continue;
+            darkPending.delete(mmsi);
 
             const { error } = await supabase.from('dark_fleet').upsert({
-                mmsi: String(v.mmsi),
-                ship_name: v.vessel_name,
-                last_known_lat: v.lat,
-                last_known_lon: v.lon,
-                last_sog: v.sog,
-                last_cog: v.cog,
-                time_went_dark: new Date(v.last_updated).toISOString()
+                mmsi: String(mmsi),
+                ship_name: p.name,
+                last_known_lat: p.lat,
+                last_known_lon: p.lon,
+                last_sog: p.sog,
+                last_cog: p.cog,
+                time_went_dark: new Date(p.t).toISOString()
             });
-
             if (error) {
                 console.error('[DARK FLEET] Save failed:', error.message);
                 continue;
             }
-            console.log(`[DARK FLEET] ${v.vessel_name} went dark in monitored zone. Saved.`);
-            darkNow.set(v.mmsi, { t: v.last_updated, lat: v.lat, lon: v.lon, sog: v.sog, cog: v.cog, name: v.vessel_name });
+            console.log(`[DARK FLEET] ${p.name} silent 30+ min in monitored zone. Saved.`);
+            darkNow.set(mmsi, p);
         }
     } catch (e) {
         console.error('[DARK FLEET ERROR]', e.message);
@@ -663,6 +680,26 @@ function addPlane(map, ac, isMil) {
     ]);
 }
 
+// If adsb.lol says "429 too many requests", reuse the last good answer (max 10 min old)
+// so frames do not suddenly lose a whole area.
+const adsbCache = new Map(); // key -> { t, list }
+async function getAircraft(key, path) {
+    try {
+        const d = await fetchAdsb(path);
+        const list = d.ac || d.aircraft || [];
+        adsbCache.set(key, { t: Date.now(), list });
+        return list;
+    } catch (e) {
+        const c = adsbCache.get(key);
+        if (c && Date.now() - c.t < 10 * MIN) {
+            console.error(`[PLAYBACK] ${key} failed (${e.message}) - reusing data from ${Math.round((Date.now() - c.t) / 1000)}s ago`);
+            return c.list;
+        }
+        console.error(`[PLAYBACK] ${key} failed:`, e.message);
+        return [];
+    }
+}
+
 let planeFrameBusy = false;
 async function takePlaneFrame() {
     if (planeFrameBusy) return;
@@ -670,21 +707,11 @@ async function takePlaneFrame() {
     try {
         const planes = new Map();
 
-        try {
-            const mil = await fetchAdsb('/mil');
-            for (const ac of (mil.ac || mil.aircraft || [])) addPlane(planes, ac, true);
-        } catch (e) {
-            console.error('[PLAYBACK] Military fetch failed:', e.message);
-        }
+        for (const ac of await getAircraft('MIL', '/mil')) addPlane(planes, ac, true);
 
         for (const a of PLANE_AREAS) {
-            await sleep(4000); // adsb.lol rate-limits fast bursts
-            try {
-                const d = await fetchAdsb(`/point/${a.lat}/${a.lon}/${a.radius}`);
-                for (const ac of (d.ac || d.aircraft || [])) addPlane(planes, ac, false);
-            } catch (e) {
-                console.error(`[PLAYBACK] Area ${a.name} failed:`, e.message);
-            }
+            await sleep(5000); // adsb.lol rate-limits fast bursts
+            for (const ac of await getAircraft(a.name, `/point/${a.lat}/${a.lon}/${a.radius}`)) addPlane(planes, ac, false);
         }
 
         if (planes.size === 0) return;
