@@ -1,21 +1,30 @@
 /* =====================================================================
-   WORLDVIEW ENGINE v2  (Render free tier + Supabase free tier)
+   WORLDVIEW ENGINE v2.2  (Render free tier + Supabase free tier)
    ---------------------------------------------------------------------
-   What is new compared to v1:
-   1. PLAYBACK  - ships near India + near Hormuz (every 15 min, 48 h)
-                  planes: global military + civil near India/Hormuz
-                  (every 3 min, 24 h). Frames are stored compactly
-                  (one DB row = one whole frame) to protect the free DB.
-   2. OIL MATH  - the old number (tankers in the box x DWT x 7.33) was a
-                  "capacity on the water" figure, NOT daily imports.
-                  Now each crude-size tanker that ARRIVES at an Indian
-                  port is counted ONCE (table oil_arrivals) -> real
-                  barrels/day. Inbound pipeline is shown separately.
-   3. FIXES     - stale ship rows deleted, radar cached in RAM (no DB
-                  read per request), reappearances under 10 min no longer
-                  lost, scraper batches DB writes, no overlapping scrapes,
-                  AIS watchdog, retention cleanup for every table.
-   Run supabase_setup.sql BEFORE deploying this file.
+   v2.2 (on top of v2.1): GLOBAL AISStream by default (ONE connection, one key),
+   permessage-deflate on + checked, gentler wait after HTTP 429, hard guarantee
+   that this process never holds two AIS sockets, /api/radar + /api/live accept
+   ?bbox=minLat,minLon,maxLat,maxLon and the radar cache is longer in global mode.
+   ---------------------------------------------------------------------
+   What is new compared to v2:
+   1. AIS FEED HEALTH  - the dark-fleet detector now knows when OUR data
+                  feed is broken. While AISStream is down, nobody can be
+                  "dark". After it comes back, every ship gets a fresh
+                  clock. Also: event-loop lag guard, "mass silence" guard,
+                  neighbour test (was anybody else heard nearby?).
+   2. AIS SOCKET - proper backoff (the counter is only reset after a
+                  stable connection), longer wait after HTTP 429, one
+                  reconnect timer only, stale-socket guard, smaller
+                  subscription box (v2.2: global is now the default; set
+                  AIS_REGIONAL=1 for the small box), clean close on SIGTERM so a new deploy
+                  does not collide with the old instance.
+   3. CRASH-PROOFING - every background job is wrapped, unhandled promise
+                  rejections are logged instead of killing the process.
+   4. SMALL FIXES - SOG 102.3 ("not available") is no longer "sailing",
+                  stale MarineTraffic rows are pruned from RAM even when
+                  scraping fails, adsb.lol uses Retry-After, longer cache,
+                  plane frames with too many missing sources are skipped.
+   Run supabase_setup.sql BEFORE deploying this file (same as v2).
    ===================================================================== */
 
 require('dotenv').config();
@@ -29,6 +38,10 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 
 puppeteer.use(StealthPlugin());
 
+// A stray rejected promise must not kill the whole radar. Log it and keep running.
+process.on('unhandledRejection', (r) => console.error('[UNHANDLED REJECTION]', r && r.message ? r.message : r));
+process.on('uncaughtException', (e) => console.error('[UNCAUGHT EXCEPTION]', e && e.message ? e.message : e));
+
 // =====================================================================
 // 0. SETTINGS (change numbers here, nowhere else)
 // =====================================================================
@@ -36,6 +49,10 @@ const PORT = process.env.PORT || 3000;
 const AIS_API_KEY = process.env.AISSTREAM_API_KEY;
 // Move your old hard-coded "vessel-image" token into this Render env variable
 const MT_VESSEL_IMAGE_TOKEN = process.env.MT_VESSEL_IMAGE_TOKEN || '';
+// Global AISStream coverage is the default. AIS_REGIONAL=1 -> only the Red Sea..Bay of Bengal box (CFG.AIS_BOX), much lighter.
+const AIS_GLOBAL = process.env.AIS_REGIONAL !== '1';
+// BLOCK_HEAVY_RESOURCES=1 -> scraper browser skips images/fonts/media (less CPU + RAM). Test before relying on it.
+const BLOCK_HEAVY_RESOURCES = process.env.BLOCK_HEAVY_RESOURCES === '1';
 
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
     console.error('Missing SUPABASE_URL or SUPABASE_KEY in environment variables.');
@@ -55,6 +72,20 @@ const CFG = {
     MIN_REAL_MOVE_NM: 2,              // came back < 2 nm away = just a coverage gap, not "dark"
     REAPPEAR_MIN_MINUTES: 5,          // log every reappearance (v1 ignored 5-10 min)
     DARK_MEMORY_MS: 72 * HOUR,        // remember dark ships in RAM for 72 h
+    DARK_MIN_NEIGHBOURS: 2,           // at confirmation, at least this many OTHER ships must have been heard nearby (0 = off)
+    DARK_NEIGHBOUR_RADIUS_NM: 30,     // "nearby" = within 30 nm of the last known position
+    DARK_NEIGHBOUR_FRESH_MS: 2 * MIN, // a neighbour counts only if it reported in the last 2 min
+    DARK_TANKERS_ONLY: false,         // true = only ships MarineTraffic already tagged as TANKER can become "dark"
+
+    // AIS feed health (these protect the dark fleet detector from OUR OWN outages)
+    AIS_BOX: [[-15, 30], [36, 100]],  // lat/lon corners we subscribe to (a bit bigger than isHighRiskZone on purpose)
+    FEED_DOWN_AFTER_MS: 45 * 1000,    // no position report for 45 s = feed is considered DOWN
+    AIS_SILENT_RESTART_MS: 90 * 1000, // socket open but no data for 90 s = restart it
+    AIS_STABLE_MS: 60 * 1000,         // a connection that lived >= 60 s counts as stable (resets the backoff)
+    LOOP_LAG_MS: 15 * 1000,           // node was blocked > 15 s (CPU starved) = restart the dark-fleet clock
+    MASS_SILENCE_MIN: 20,             // 20+ ships going silent in one check ...
+    MASS_SILENCE_FRACTION: 0.25,      // ... and more than 25% of all sailing ships = feed/coverage problem, not dark ships
+
     // scraper
     SWEEP_EVERY_MS: (Number(process.env.SWEEP_INTERVAL_MIN) || 5) * MIN,
     STALE_INTEL_MS: 1 * HOUR,         // MarineTraffic rows older than this are deleted
@@ -64,6 +95,10 @@ const CFG = {
     PLANE_FRAME_EVERY_MS: 5 * MIN,
     PLANE_FRAME_KEEP_H: 24,
     FRAME_MAX_AGE_MS: 20 * MIN,       // ignore ship positions older than this when taking a frame
+    // adsb.lol
+    ADSB_GAP_MS: 8000,                // pause between area requests (adsb.lol rate-limits fast bursts)
+    ADSB_CACHE_MS: 15 * MIN,          // reuse the last good answer for this long when adsb.lol says 429
+    PLANE_MAX_MISSING: 1,             // skip a plane frame if MORE than this many sources failed completely
     // retention of the other tables (days)
     DARK_KEEP_DAYS: 30,
     OIL_HISTORY_KEEP_DAYS: 90,
@@ -138,6 +173,11 @@ const clampInt = (v, min, max, def) => {
 };
 const inBox = (lat, lon, b) => lat >= b.latMin && lat <= b.latMax && lon >= b.lonMin && lon <= b.lonMax;
 
+// Wrap a background job so one failure (e.g. a network error) can never become an unhandled rejection
+const safeJob = (name, fn) => async () => {
+    try { await fn(); } catch (e) { console.error(`[JOB ${name}]`, e && e.message ? e.message : e); }
+};
+
 function haversineNm(lat1, lon1, lat2, lon2) {
     const R = 3440.065; // earth radius in nautical miles
     const toRad = (d) => (d * Math.PI) / 180;
@@ -188,6 +228,9 @@ const deepIntel = {              // MarineTraffic rows, kept in RAM so /api/rada
 };
 const recentArrivals = new Map(); // mmsi(string) -> last time seen inside an Indian port zone (ms)
 let firstIndiaSweepDone = false;
+let shuttingDown = false;
+let server = null;
+let currentBrowser = null;
 
 function intelFor(mmsiStr) {
     return deepIntel.india.get(mmsiStr) || deepIntel.hormuz.get(mmsiStr) || null;
@@ -197,11 +240,62 @@ function catFromCategory(c) {
 }
 
 // =====================================================================
-// 3. AISSTREAM WORKER (live ships -> RAM)
+// 3. AIS FEED HEALTH
+// ---------------------------------------------------------------------
+// The dark-fleet detector judges ships by "how long since we last heard
+// them". That is only fair while OUR feed is healthy. If AISStream drops
+// us, or node is starved of CPU, every ship looks silent. So:
+//   - feed.lastMsgAt   = last position report received (any ship)
+//   - feed.resumedAt   = start of the current "fresh clock": ship silence
+//                        is only counted from this moment on
+// =====================================================================
+const feed = {
+    lastMsgAt: 0,
+    resumedAt: 0,
+    outages: 0,
+    pausedLogged: false
+};
+
+function feedIsUp(now = Date.now()) {
+    return feed.lastMsgAt > 0 && now - feed.lastMsgAt <= CFG.FEED_DOWN_AFTER_MS;
+}
+
+function noteFeedMessage(now) {
+    if (feed.lastMsgAt === 0) {
+        feed.resumedAt = now; // first data since boot
+    } else if (now - feed.lastMsgAt > CFG.FEED_DOWN_AFTER_MS) {
+        feed.resumedAt = now;
+        feed.outages++;
+        console.log(`[AIS] Data flowing again after ${Math.round((now - feed.lastMsgAt) / 1000)}s of silence - dark-fleet clock restarted.`);
+    }
+    feed.lastMsgAt = now;
+}
+
+// How long has this ship really been silent, ignoring time when OUR feed was broken?
+const silentFor = (v, now) => now - Math.max(v.last_updated, feed.resumedAt);
+
+// Event-loop lag guard: on a 0.1 CPU instance (Chrome + AIS + Express) node can freeze for a while.
+// After a freeze, timers can run BEFORE the buffered AIS messages are read, so ships look older than they are.
+let lastTick = Date.now();
+setInterval(() => {
+    const now = Date.now();
+    const lag = now - lastTick - 1000;
+    lastTick = now;
+    if (lag > CFG.LOOP_LAG_MS) {
+        feed.resumedAt = now;
+        console.log(`[HEALTH] Event loop was blocked ~${Math.round(lag / 1000)}s (CPU starved?) - dark-fleet clock restarted.`);
+    }
+}, 1000);
+
+// =====================================================================
+// 4. AISSTREAM WORKER (live ships -> RAM)
 // =====================================================================
 let aisSocket = null;
-let lastAisMessageAt = Date.now();
-let aisFailures = 0; // consecutive failed connections (for the growing wait)
+let reconnectTimer = null;
+let lastAisActivityAt = Date.now(); // any message at all (for the watchdog)
+let aisFailures = 0;                // consecutive failed/unstable connections (for the growing wait)
+let aisRateLimited = false;         // the last attempt ended with HTTP 429
+const aisStats = { reconnects: 0, lastConnectedAt: 0, compression: null };
 
 async function logReappearance(mmsi, name, dark, lat, lon) {
     const now = Date.now();
@@ -235,27 +329,68 @@ async function logReappearance(mmsi, name, dark, lat, lon) {
     if (error) console.error('Failed to log reappearance:', error.message);
 }
 
+function scheduleReconnect(livedMs) {
+    if (reconnectTimer || shuttingDown) return; // never more than ONE pending reconnect
+    const step = Math.min(aisFailures, 4);
+    // normal drops: 5, 10, 20, 40, 60 s.  HTTP 429: 60, 120, 240, 480, 600 s.
+    // Hammering a 429 does not help, and one AISStream user reports that endless fast retries may
+    // have got their whole account throttled, so after a 429 we stay quiet for a long time.
+    let wait = aisRateLimited
+        ? Math.min(600000, 60000 * Math.pow(2, step))
+        : Math.min(60000, 5000 * Math.pow(2, step));
+    wait += Math.floor(Math.random() * 2000); // small random jitter
+    aisFailures++;
+    aisStats.reconnects++;
+    const lived = livedMs > 0 ? ` after ${Math.round(livedMs / 1000)}s` : '';
+    console.log(`[AIS] Disconnected${lived}${aisRateLimited ? ' (rate limited, HTTP 429)' : ''}. Reconnecting in ${Math.round(wait / 1000)}s...`);
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectAIS();
+    }, wait);
+}
+
 function connectAIS() {
-    console.log('[AIS] Connecting to global feed...');
-    const ws = new WebSocket('wss://stream.aisstream.io/v0/stream');
+    if (shuttingDown) return;
+    // AISStream allows only 3 subscribed connections per account and 3 open connections per IP
+    // (checked before login). This process must NEVER hold more than one.
+    if (aisSocket && (aisSocket.readyState === WebSocket.CONNECTING || aisSocket.readyState === WebSocket.OPEN)) return;
+    console.log(`[AIS] Connecting to ${AIS_GLOBAL ? 'global' : 'regional'} feed...`);
+    // permessage-deflate: uncompressed connections are bandwidth-limited by AISStream (since Sept 2026)
+    const ws = new WebSocket('wss://stream.aisstream.io/v0/stream', { perMessageDeflate: true, handshakeTimeout: 15000 });
     aisSocket = ws;
-    lastAisMessageAt = Date.now();
+    aisRateLimited = false;
+    lastAisActivityAt = Date.now();
+    let openedAt = 0;
 
     ws.on('open', () => {
+        openedAt = Date.now();
+        aisStats.lastConnectedAt = openedAt;
+        lastAisActivityAt = openedAt;
         console.log('[AIS] Connected. Streaming live to RAM...');
         ws.send(JSON.stringify({
             APIKey: AIS_API_KEY,
-            BoundingBoxes: [[[-90, -180], [90, 180]]],
+            BoundingBoxes: AIS_GLOBAL ? [[[-90, -180], [90, 180]]] : [CFG.AIS_BOX],
             FilterMessageTypes: ['PositionReport']
         }));
     });
 
     ws.on('message', (data) => {
-        lastAisMessageAt = Date.now();
-        aisFailures = 0;
+        const now = Date.now();
+        lastAisActivityAt = now;
+        // NOTE: v2 reset the backoff counter here, which made a connection that lived 3 seconds
+        // look "healthy" and caused a tight reconnect loop. The reset now happens in 'close'.
         try {
             const msg = JSON.parse(data);
+            if (msg.error) { console.error('[AIS] Server message:', msg.error); return; }
+            if (msg.MessageType === 'SubscriptionConfirmation') {
+                const on = !!(msg.Message && msg.Message.CompressionEnabled);
+                aisStats.compression = on;
+                console.log(`[AIS] Subscription confirmed. Compression: ${on ? 'ON' : 'OFF - uncompressed connections get bandwidth-limited and messages are dropped'}`);
+                return;
+            }
             if (msg.MessageType !== 'PositionReport') return;
+
+            noteFeedMessage(now);
 
             const report = msg.Message.PositionReport;
             const meta = msg.MetaData;
@@ -263,6 +398,7 @@ function connectAIS() {
             const lat = report.Latitude;
             const lon = report.Longitude;
             if (!Number.isFinite(mmsi) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return;
+            if (lat === 0 && lon === 0) return; // classic "no GPS fix" garbage
 
             const name = meta.ShipName ? meta.ShipName.trim() : 'UNKNOWN';
 
@@ -273,7 +409,7 @@ function connectAIS() {
                 lon: lon,
                 sog: report.Sog,
                 cog: report.Cog,
-                last_updated: Date.now()
+                last_updated: now
             });
 
             // --- REAPPEARANCE DETECTOR ---
@@ -281,36 +417,59 @@ function connectAIS() {
             const dark = darkNow.get(mmsi);
             if (dark) {
                 darkNow.delete(mmsi);
-                logReappearance(mmsi, name, dark, lat, lon);
+                // not awaited on purpose, but a failure must not become an unhandled rejection
+                logReappearance(mmsi, name, dark, lat, lon).catch((e) => console.error('[DARK FLEET] Reappearance error:', e.message));
             }
         } catch (e) { /* ignore bad message */ }
     });
 
     ws.on('error', (error) => {
         console.error(`[AIS CONNECTION ERROR] ${error.message}`);
+        if (/429/.test(String(error.message))) aisRateLimited = true;
     });
 
     ws.on('close', () => {
-        // wait 5s, 10s, 20s, 40s, then 60s between tries (hammering AISStream keeps the 429 going)
-        const wait = Math.min(60000, 5000 * Math.pow(2, Math.min(aisFailures, 4)));
-        aisFailures++;
-        console.log(`[AIS] Disconnected. Reconnecting in ${wait / 1000}s...`);
-        setTimeout(connectAIS, wait);
+        if (ws !== aisSocket) return; // an old socket closing late must not trigger a second reconnect
+        aisSocket = null;
+        if (shuttingDown) return;
+        const lived = openedAt ? Date.now() - openedAt : 0;
+        if (lived >= CFG.AIS_STABLE_MS) aisFailures = 0; // only a STABLE connection resets the backoff
+        scheduleReconnect(lived);
     });
 }
 
 // Watchdog: if AISStream stops sending data without closing, restart the socket
 setInterval(() => {
-    if (aisSocket && Date.now() - lastAisMessageAt > 90 * 1000) {
-        console.log('[AIS] No data for 90s - restarting connection');
-        lastAisMessageAt = Date.now();
+    if (aisSocket && aisSocket.readyState === WebSocket.OPEN && Date.now() - lastAisActivityAt > CFG.AIS_SILENT_RESTART_MS) {
+        console.log(`[AIS] No data for ${CFG.AIS_SILENT_RESTART_MS / 1000}s - restarting connection`);
+        lastAisActivityAt = Date.now();
         try { aisSocket.terminate(); } catch (e) { /* ignore */ }
     }
 }, 30 * 1000);
 
 // =====================================================================
-// 4. DARK FLEET DETECTOR
+// 5. DARK FLEET DETECTOR  (feed-aware)
+// ---------------------------------------------------------------------
+// Honest naming: this finds "AIS GAP CANDIDATES" - sailing ships that we
+// stopped hearing for 30+ min while our feed was healthy and other ships
+// nearby were still heard. It cannot prove that a transponder was switched
+// off (receiver range, ships leaving the area and spoofing are invisible).
 // =====================================================================
+const isSailing = (v) => typeof v.sog === 'number' && v.sog >= CFG.DARK_MIN_SOG && v.sog < 102.3; // 102.3 = "not available"
+
+// How many OTHER ships were heard recently around this position?
+function countNeighbours(p, now) {
+    const dLat = CFG.DARK_NEIGHBOUR_RADIUS_NM / 60; // 1 degree of latitude = 60 nm
+    const dLon = dLat / Math.max(0.2, Math.cos((p.lat * Math.PI) / 180));
+    let n = 0;
+    for (const o of liveVessels.values()) {
+        if (now - o.last_updated > CFG.DARK_NEIGHBOUR_FRESH_MS) continue;
+        if (Math.abs(o.lat - p.lat) > dLat || Math.abs(o.lon - p.lon) > dLon) continue; // cheap pre-filter
+        if (haversineNm(p.lat, p.lon, o.lat, o.lon) <= CFG.DARK_NEIGHBOUR_RADIUS_NM) n++;
+    }
+    return n;
+}
+
 let darkBusy = false;
 async function detectDarkFleet() {
     if (darkBusy) return;
@@ -318,21 +477,59 @@ async function detectDarkFleet() {
     try {
         const now = Date.now();
 
+        // GUARD 1: our own feed is down -> nobody can be called dark right now
+        if (!feedIsUp(now)) {
+            if (!feed.pausedLogged) {
+                console.log('[DARK FLEET] AIS feed is down - detection paused (no ship can be called dark while we are deaf).');
+                feed.pausedLogged = true;
+            }
+            return;
+        }
+        feed.pausedLogged = false;
+
         // Step 1: sailing ships that went silent for 5+ min become "pending" (RAM only)
+        let sailing = 0;
+        const silent = [];
         for (const v of liveVessels.values()) {
-            const age = now - v.last_updated;
-            if (age > CFG.DARK_THRESHOLD_MS && (v.sog || 0) >= CFG.DARK_MIN_SOG && isHighRiskZone(v.lat, v.lon)) {
-                liveVessels.delete(v.mmsi);
-                if (!darkNow.has(v.mmsi) && !darkPending.has(v.mmsi)) {
-                    darkPending.set(v.mmsi, { t: v.last_updated, lat: v.lat, lon: v.lon, sog: v.sog, cog: v.cog, name: v.vessel_name });
-                }
+            if (!isSailing(v) || !isHighRiskZone(v.lat, v.lon)) continue;
+            sailing++;
+            if (silentFor(v, now) > CFG.DARK_THRESHOLD_MS) silent.push(v);
+        }
+
+        // GUARD 2: "mass silence" - a big share of all ships going quiet at the same moment is a
+        // feed / receiver problem, not a fleet of ships switching off AIS together.
+        if (silent.length >= CFG.MASS_SILENCE_MIN && silent.length > sailing * CFG.MASS_SILENCE_FRACTION) {
+            console.log(`[DARK FLEET] ${silent.length} of ${sailing} sailing ships went silent together - feed/coverage problem, not flagging them. Clock restarted.`);
+            for (const v of silent) liveVessels.delete(v.mmsi); // forget them quietly; they come back with their next message
+            feed.resumedAt = now;
+            return;
+        }
+
+        for (const v of silent) {
+            liveVessels.delete(v.mmsi);
+            if (CFG.DARK_TANKERS_ONLY) {
+                const intel = intelFor(String(v.mmsi));
+                if (!intel || intel.category !== 'TANKER') continue;
+            }
+            if (!darkNow.has(v.mmsi) && !darkPending.has(v.mmsi)) {
+                darkPending.set(v.mmsi, { t: v.last_updated, lat: v.lat, lon: v.lon, sog: v.sog, cog: v.cog, name: v.vessel_name });
             }
         }
 
         // Step 2: still silent after 30 min -> confirmed dark, save to Supabase
         for (const [mmsi, p] of darkPending) {
-            if (now - p.t < CFG.DARK_CONFIRM_MS) continue;
+            // the 30 min are counted from the last moment OUR feed was healthy again
+            if (now - Math.max(p.t, feed.resumedAt) < CFG.DARK_CONFIRM_MS) continue;
             darkPending.delete(mmsi);
+
+            // GUARD 3: neighbour test - if nobody else near that spot is heard either, it is a coverage hole
+            if (CFG.DARK_MIN_NEIGHBOURS > 0) {
+                const n = countNeighbours(p, now);
+                if (n < CFG.DARK_MIN_NEIGHBOURS) {
+                    console.log(`[DARK FLEET] ${p.name}: only ${n} other ship(s) heard nearby - likely a coverage hole, not saved.`);
+                    continue;
+                }
+            }
 
             const { error } = await supabase.from('dark_fleet').upsert({
                 mmsi: String(mmsi),
@@ -358,7 +555,7 @@ async function detectDarkFleet() {
 }
 
 // =====================================================================
-// 5. MARINETRAFFIC SCRAPER (regional deep intel)  - now batched
+// 6. MARINETRAFFIC SCRAPER (regional deep intel)  - batched
 // =====================================================================
 function mtHeaders() {
     const h = {
@@ -479,8 +676,8 @@ async function sweepZone(page, zone) {
 
 let sweepRunning = false;
 async function runRegionalSweep() {
-    if (sweepRunning) {
-        console.log('[STEALTH] Previous sweep still running, skipping this round.');
+    if (sweepRunning || shuttingDown) {
+        if (sweepRunning) console.log('[STEALTH] Previous sweep still running, skipping this round.');
         return;
     }
     sweepRunning = true;
@@ -491,19 +688,35 @@ async function runRegionalSweep() {
             headless: true,
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
         });
+        currentBrowser = browser;
         const page = await browser.newPage();
+
+        if (BLOCK_HEAVY_RESOURCES) {
+            // we only need the session/cookies from the page, not its pictures and fonts
+            await page.setRequestInterception(true);
+            page.on('request', (req) => {
+                const t = req.resourceType();
+                if (t === 'image' || t === 'media' || t === 'font') req.abort().catch(() => {});
+                else req.continue().catch(() => {});
+            });
+        }
+
         await page.goto('https://www.marinetraffic.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
-        for (const zone of ZONES) await sweepZone(page, zone);
+        for (const zone of ZONES) {
+            if (shuttingDown) break;
+            await sweepZone(page, zone);
+        }
     } catch (error) {
         console.error('[STEALTH ERROR]:', error.message);
     } finally {
         if (browser) await browser.close().catch(() => {});
+        currentBrowser = null;
         sweepRunning = false;
     }
 }
 
 // =====================================================================
-// 6. OIL ANALYTICS  (fixed math)
+// 7. OIL ANALYTICS  (fixed math)
 // ---------------------------------------------------------------------
 // OLD (wrong for "per day"): sum(DWT x 7.33) of every tanker inside the box.
 //   - that is tanker CAPACITY on the water at one moment, not a daily flow
@@ -512,6 +725,8 @@ async function runRegionalSweep() {
 // NEW: count every crude-size tanker ONCE when it reaches an Indian port:
 //   barrels = DWT x 0.90 x 7.33      (only ships with DWT >= 60,000)
 //   daily imports = sum of barrels of tankers that arrived that IST day
+// Note: DWT alone cannot tell a crude tanker from a big product tanker, so
+// the totals are an upper-bound style estimate.
 // =====================================================================
 function isCrudeSize(s) {
     return s.category === 'TANKER' && Number(s.dwt) >= OIL.MIN_CRUDE_DWT;
@@ -607,7 +822,7 @@ async function takeOilSnapshot() {
 }
 
 // =====================================================================
-// 7. PLAYBACK RECORDERS
+// 8. PLAYBACK RECORDERS
 // ---------------------------------------------------------------------
 // One DB row = one full frame (jsonb array of small arrays). This keeps the
 // row count tiny and the free Supabase database small.
@@ -659,11 +874,12 @@ async function takeShipFrames() {
 async function fetchAdsb(path, attempt = 1) {
     const res = await fetch('https://api.adsb.lol/v2' + path, {
         signal: AbortSignal.timeout(15000),
-        headers: { 'user-agent': 'worldview-radar/2.0' }
+        headers: { 'user-agent': 'worldview-radar/2.1' }
     });
-    // Rate limited (429): wait and try once more
+    // Rate limited (429): wait (respect Retry-After if present) and try once more
     if (res.status === 429 && attempt < 2) {
-        await sleep(8000);
+        const ra = Number(res.headers.get('retry-after'));
+        await sleep(Number.isFinite(ra) && ra > 0 ? Math.min(ra, 20) * 1000 : 8000);
         return fetchAdsb(path, attempt + 1);
     }
     if (!res.ok) throw new Error('ADSB HTTP ' + res.status);
@@ -689,8 +905,8 @@ function addPlane(map, ac, isMil) {
     ]);
 }
 
-// If adsb.lol says "429 too many requests", reuse the last good answer (max 10 min old)
-// so frames do not suddenly lose a whole area.
+// If adsb.lol says "429 too many requests", reuse the last good answer (max 15 min old)
+// so frames do not suddenly lose a whole area. Returns null when there is nothing at all.
 const adsbCache = new Map(); // key -> { t, list }
 async function getAircraft(key, path) {
     try {
@@ -700,12 +916,12 @@ async function getAircraft(key, path) {
         return list;
     } catch (e) {
         const c = adsbCache.get(key);
-        if (c && Date.now() - c.t < 10 * MIN) {
+        if (c && Date.now() - c.t < CFG.ADSB_CACHE_MS) {
             console.error(`[PLAYBACK] ${key} failed (${e.message}) - reusing data from ${Math.round((Date.now() - c.t) / 1000)}s ago`);
             return c.list;
         }
         console.error(`[PLAYBACK] ${key} failed:`, e.message);
-        return [];
+        return null;
     }
 }
 
@@ -715,14 +931,22 @@ async function takePlaneFrame() {
     planeFrameBusy = true;
     try {
         const planes = new Map();
+        let missing = 0;
 
-        for (const ac of await getAircraft('MIL', '/mil')) addPlane(planes, ac, true);
+        const mil = await getAircraft('MIL', '/mil');
+        if (mil) { for (const ac of mil) addPlane(planes, ac, true); } else missing++;
 
         for (const a of PLANE_AREAS) {
-            await sleep(5000); // adsb.lol rate-limits fast bursts
-            for (const ac of await getAircraft(a.name, `/point/${a.lat}/${a.lon}/${a.radius}`)) addPlane(planes, ac, false);
+            await sleep(CFG.ADSB_GAP_MS); // adsb.lol rate-limits fast bursts
+            const list = await getAircraft(a.name, `/point/${a.lat}/${a.lon}/${a.radius}`);
+            if (list) { for (const ac of list) addPlane(planes, ac, false); } else missing++;
         }
 
+        // A frame with a whole area missing makes planes "vanish" in playback. A gap is more honest.
+        if (missing > CFG.PLANE_MAX_MISSING) {
+            console.log(`[PLAYBACK] Plane frame skipped: ${missing} of ${PLANE_AREAS.length + 1} sources failed completely.`);
+            return;
+        }
         if (planes.size === 0) return;
         const list = Array.from(planes.values());
         const { error } = await supabase.from('plane_frames').insert({ plane_count: list.length, planes: list });
@@ -736,9 +960,19 @@ async function takePlaneFrame() {
 }
 
 // =====================================================================
-// 8. HOUSEKEEPING  (keeps the free Supabase database small)
+// 9. HOUSEKEEPING  (keeps the free Supabase database and RAM small)
 // =====================================================================
 async function cleanupOldData() {
+    // RAM first (cannot fail)
+    const now = Date.now();
+    for (const [mmsi, d] of darkNow) {
+        if (now - d.t > CFG.DARK_MEMORY_MS) darkNow.delete(mmsi);
+    }
+    for (const [mmsi, t] of recentArrivals) {
+        if (now - t > OIL.REARRIVAL_BLOCK_MS * 2) recentArrivals.delete(mmsi);
+    }
+
+    // then the database; one failing table must not stop the others
     const jobs = [
         ['ship_frames', 'ts', CFG.SHIP_FRAME_KEEP_H],
         ['plane_frames', 'ts', CFG.PLANE_FRAME_KEEP_H],
@@ -748,30 +982,39 @@ async function cleanupOldData() {
         ['oil_arrivals', 'arrived_at', CFG.ARRIVALS_KEEP_DAYS * 24]
     ];
     for (const [table, col, hours] of jobs) {
-        const { error } = await supabase.from(table).delete().lt(col, hoursAgoISO(hours));
-        if (error) console.error(`[CLEANUP] ${table}:`, error.message);
-    }
-
-    const now = Date.now();
-    for (const [mmsi, d] of darkNow) {
-        if (now - d.t > CFG.DARK_MEMORY_MS) darkNow.delete(mmsi);
-    }
-    for (const [mmsi, t] of recentArrivals) {
-        if (now - t > OIL.REARRIVAL_BLOCK_MS * 2) recentArrivals.delete(mmsi);
+        try {
+            const { error } = await supabase.from(table).delete().lt(col, hoursAgoISO(hours));
+            if (error) console.error(`[CLEANUP] ${table}:`, error.message);
+        } catch (e) {
+            console.error(`[CLEANUP] ${table}:`, e.message);
+        }
     }
     console.log('[CLEANUP] Done.');
 }
 
-// Ships that stopped reporting for 15 min are removed from the live map (every 5 min)
-function cleanLiveVessels() {
+// Every 5 min: forget ships that stopped reporting and MarineTraffic rows that are too old
+function cleanMemory() {
     const now = Date.now();
-    for (const [mmsi, v] of liveVessels) {
-        if (now - v.last_updated > 15 * MIN) liveVessels.delete(mmsi);
+
+    // Only judge silence while our feed is healthy (and count it from the last "fresh clock" moment)
+    if (feedIsUp(now)) {
+        for (const [mmsi, v] of liveVessels) {
+            if (silentFor(v, now) > 15 * MIN) liveVessels.delete(mmsi);
+        }
+    }
+
+    // v2 only pruned MarineTraffic rows after a SUCCESSFUL sweep. If scraping keeps failing,
+    // old rows stayed in RAM forever and polluted the radar and the oil numbers.
+    const cutoff = now - CFG.STALE_INTEL_MS;
+    for (const map of [deepIntel.india, deepIntel.hormuz]) {
+        for (const [k, r] of map) {
+            if (!(Date.parse(r.last_updated) > cutoff)) map.delete(k);
+        }
     }
 }
 
 // =====================================================================
-// 9. LOAD STATE FROM THE DATABASE AFTER A RESTART
+// 10. LOAD STATE FROM THE DATABASE AFTER A RESTART
 // =====================================================================
 async function loadFromDatabase() {
     try {
@@ -807,7 +1050,7 @@ async function loadFromDatabase() {
 }
 
 // =====================================================================
-// 10. EXPRESS API
+// 11. EXPRESS API
 // =====================================================================
 const app = express();
 app.use(cors());
@@ -829,17 +1072,47 @@ const normRegion = (r) => {
 app.get('/', (_req, res) => res.status(200).send('WORLDVIEW ENGINE SECURE & ACTIVE'));
 
 app.get('/api/status', (_req, res) => {
+    const now = Date.now();
+    const up = feedIsUp(now);
     res.json({
         live_vessels: liveVessels.size,
         india_intel: deepIntel.india.size,
         hormuz_intel: deepIntel.hormuz.size,
         dark_ships_tracked: darkNow.size,
+        dark_pending: darkPending.size,
+        ais: {
+            scope: AIS_GLOBAL ? 'global' : 'regional',
+            socket_open: !!(aisSocket && aisSocket.readyState === WebSocket.OPEN),
+            feed_up: up,
+            dark_detection_paused: !up,
+            last_position_age_s: feed.lastMsgAt ? Math.round((now - feed.lastMsgAt) / 1000) : null,
+            dark_clock_started_s_ago: feed.resumedAt ? Math.round((now - feed.resumedAt) / 1000) : null,
+            outages_since_boot: feed.outages,
+            reconnects_since_boot: aisStats.reconnects,
+            compression: aisStats.compression
+        },
         uptime_min: Math.round(process.uptime() / 60)
     });
 });
 
+// ?bbox=minLat,minLon,maxLat,maxLon  (optional, for /api/live and /api/radar)
+// With the global AIS feed these routes can return 100k+ ships. A frontend should ask only for what is on screen.
+function parseBbox(q) {
+    if (!q) return null;
+    const p = String(q).split(',').map(Number);
+    if (p.length !== 4 || p.some((n) => !Number.isFinite(n))) return null;
+    return {
+        latMin: Math.min(p[0], p[2]), lonMin: Math.min(p[1], p[3]),
+        latMax: Math.max(p[0], p[2]), lonMax: Math.max(p[1], p[3])
+    };
+}
+
 // Route 1: raw AIS ships from RAM
-app.get('/api/live', (_req, res) => res.json(Array.from(liveVessels.values())));
+app.get('/api/live', (req, res) => {
+    const box = parseBbox(req.query.bbox);
+    const all = Array.from(liveVessels.values());
+    res.json(box ? all.filter((v) => inBox(v.lat, v.lon, box)) : all);
+});
 
 // Route 2: fused radar (RAM only, cached 4 s - no Supabase call per request)
 function buildRadar() {
@@ -860,18 +1133,24 @@ function buildRadar() {
     }
     return Array.from(master.values());
 }
-let radarCache = { ts: 0, body: '[]' };
-app.get('/api/radar', (_req, res) => {
+// Building the radar for a whole-world feed is heavy on a 0.1 CPU instance (and a blocked event loop
+// starves the AIS socket), so in global mode it is rebuilt at most every 15 s.
+const RADAR_CACHE_MS = AIS_GLOBAL ? 15000 : 4000;
+let radarCache = { ts: 0, list: [], body: '[]' };
+app.get('/api/radar', (req, res) => {
     try {
-        if (Date.now() - radarCache.ts > 4000) radarCache = { ts: Date.now(), body: JSON.stringify(buildRadar()) };
+        if (Date.now() - radarCache.ts > RADAR_CACHE_MS) radarCache = { ts: Date.now(), list: buildRadar(), body: null };
+        const box = parseBbox(req.query.bbox);
+        if (box) return res.json(radarCache.list.filter((s) => inBox(s.lat, s.lon, box)));
+        if (radarCache.body === null) radarCache.body = JSON.stringify(radarCache.list);
         res.type('application/json').send(radarCache.body);
     } catch (e) {
         console.error('[RADAR ERROR]', e.message);
-        res.type('application/json').send(radarCache.body); // serve last good copy
+        res.type('application/json').send(radarCache.body || '[]'); // serve last good copy
     }
 });
 
-// Route 3: dark fleet
+// Route 3: dark fleet ("AIS gap candidates")
 app.get('/api/dark-fleet', async (_req, res) => {
     try {
         const { data, error } = await supabase.from('dark_fleet').select('*').order('time_went_dark', { ascending: false }).limit(50);
@@ -1072,28 +1351,50 @@ app.get('/api/playback/planes/trail/:hex', async (req, res) => {
 });
 
 // =====================================================================
-// 11. BOOT
+// 12. GRACEFUL SHUTDOWN
+// ---------------------------------------------------------------------
+// On a Render deploy the old instance gets SIGTERM. Closing the AIS socket
+// and Chrome here means the NEW instance does not collide with a still-open
+// connection from the old one (a likely source of the 429s at boot).
 // =====================================================================
-app.listen(PORT, async () => {
-    console.log(`=== WORLDVIEW ENGINE v2 RUNNING ON PORT ${PORT} ===`);
+async function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[SHUTDOWN] ${signal} received - closing AIS socket and browser...`);
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    try { if (aisSocket) aisSocket.terminate(); } catch (e) { /* ignore */ }
+    try { if (currentBrowser) await currentBrowser.close(); } catch (e) { /* ignore */ }
+    if (server) server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+// =====================================================================
+// 13. BOOT
+// =====================================================================
+server = app.listen(PORT, async () => {
+    console.log(`=== WORLDVIEW ENGINE v2.1 RUNNING ON PORT ${PORT} ===`);
     if (!MT_VESSEL_IMAGE_TOKEN) console.warn('[WARN] MT_VESSEL_IMAGE_TOKEN is not set - MarineTraffic scraping may fail.');
 
     await loadFromDatabase();
-    connectAIS();
-    runRegionalSweep();
 
-    setInterval(runRegionalSweep, CFG.SWEEP_EVERY_MS);
-    setInterval(detectDarkFleet, 60 * 1000);
-    setInterval(cleanLiveVessels, 5 * MIN);
-    setInterval(takeOilSnapshot, HOUR);
-    setTimeout(takeOilSnapshot, 3 * MIN); // after the first scrape has finished
+    if (AIS_API_KEY) connectAIS();
+    else console.error('[AIS] AISSTREAM_API_KEY is not set - live AIS and dark-fleet detection are disabled.');
+
+    safeJob('sweep', runRegionalSweep)();
+    setInterval(safeJob('sweep', runRegionalSweep), CFG.SWEEP_EVERY_MS);
+    setInterval(safeJob('dark-fleet', detectDarkFleet), 60 * 1000);
+    setInterval(safeJob('memory', cleanMemory), 5 * MIN);
+    setInterval(safeJob('oil-snapshot', takeOilSnapshot), HOUR);
+    setTimeout(safeJob('oil-snapshot', takeOilSnapshot), 3 * MIN); // after the first scrape has finished
 
     // wait a little so the AIS feed can fill up before the first frame
-    setTimeout(takeShipFrames, 2 * MIN);
-    setInterval(takeShipFrames, CFG.SHIP_FRAME_EVERY_MS);
-    setTimeout(takePlaneFrame, 20 * 1000);
-    setInterval(takePlaneFrame, CFG.PLANE_FRAME_EVERY_MS);
+    setTimeout(safeJob('ship-frames', takeShipFrames), 2 * MIN);
+    setInterval(safeJob('ship-frames', takeShipFrames), CFG.SHIP_FRAME_EVERY_MS);
+    setTimeout(safeJob('plane-frame', takePlaneFrame), 20 * 1000);
+    setInterval(safeJob('plane-frame', takePlaneFrame), CFG.PLANE_FRAME_EVERY_MS);
 
-    setTimeout(cleanupOldData, 60 * 1000);
-    setInterval(cleanupOldData, HOUR);
+    setTimeout(safeJob('cleanup', cleanupOldData), 60 * 1000);
+    setInterval(safeJob('cleanup', cleanupOldData), HOUR);
 });
